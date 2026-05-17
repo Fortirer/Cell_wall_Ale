@@ -1,0 +1,186 @@
+library(tidyverse)
+library(igraph)
+library(readxl)
+
+# =========================
+# 1. Ler arquivo normalizado
+# =========================
+
+expr_file <- "Ale_Matriz_Normalizada_log2CPM.xlsx"
+
+expr_raw <- read_excel(
+  expr_file,
+  sheet = "Matriz_Normalizada_log2CPM"
+)
+
+expr_raw <- as.data.frame(expr_raw)
+
+# =========================
+# 2. Definir genes e matriz
+# =========================
+
+expr_raw$GeneLabel <- make.unique(
+  paste(expr_raw$GeneID, expr_raw$geneName, sep = "_")
+)
+
+sample_cols <- grep(
+  "^(C|T)_(12h|48h|1w)_rep[0-9]+$",
+  colnames(expr_raw),
+  value = TRUE
+)
+
+if (length(sample_cols) == 0) {
+  stop("Nenhuma coluna de amostra encontrada. Confira os nomes das colunas.")
+}
+
+all_mat <- expr_raw[, sample_cols, drop = FALSE]
+rownames(all_mat) <- expr_raw$GeneLabel
+
+all_mat[] <- lapply(
+  all_mat,
+  function(x) as.numeric(as.character(x))
+)
+
+all_mat <- all_mat[rowSums(is.na(all_mat)) == 0, ]
+
+gene_annotation <- expr_raw %>%
+  select(GeneLabel, GeneID, geneName)
+
+# =========================
+# 3. Função para construir rede por tratamento
+# =========================
+
+build_network <- function(treatment_pattern, name, cor_cut = 0.85) {
+  
+  message("Processando tratamento: ", name, "...")
+  
+  cols <- grep(
+    paste0("^", treatment_pattern, "_rep[0-9]+$"),
+    colnames(all_mat),
+    value = TRUE
+  )
+  
+  if (length(cols) < 2) {
+    message("⚠️ Poucas colunas encontradas para: ", name)
+    return(NULL)
+  }
+  
+  mat <- all_mat[, cols, drop = FALSE]
+  
+  # remover genes com variância zero dentro do tratamento
+  gene_var <- apply(mat, 1, var, na.rm = TRUE)
+  mat <- mat[gene_var > 0, , drop = FALSE]
+  
+  if (nrow(mat) < 2) {
+    message("⚠️ Poucos genes com variação para: ", name)
+    return(NULL)
+  }
+  
+  # correlação entre todos os genes
+  cor_matrix <- cor(
+    t(mat),
+    method = "pearson",
+    use = "pairwise.complete.obs"
+  )
+  
+  diag(cor_matrix) <- NA
+  
+  edges_idx <- which(
+    abs(cor_matrix) > cor_cut,
+    arr.ind = TRUE
+  )
+  
+  edges_idx <- edges_idx[
+    edges_idx[, 1] < edges_idx[, 2],
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(edges_idx) == 0) {
+    message("⚠️ Nenhuma aresta encontrada para: ", name)
+    return(NULL)
+  }
+  
+  network <- data.frame(
+    source = rownames(cor_matrix)[edges_idx[, 1]],
+    target = colnames(cor_matrix)[edges_idx[, 2]],
+    correlation = cor_matrix[edges_idx],
+    stringsAsFactors = FALSE
+  )
+  
+  network$weight <- abs(network$correlation)
+  network$distance <- 1 - abs(network$correlation)
+  network$distance <- pmax(network$distance, 1e-6)
+  
+  write.table(
+    network,
+    paste0("Edges_", name, ".csv"),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  g <- graph_from_data_frame(
+    network,
+    directed = FALSE
+  )
+  
+  E(g)$weight <- network$weight
+  E(g)$distance <- network$distance
+  
+  deg <- degree(g)
+  
+  bet <- betweenness(
+    g,
+    weights = E(g)$distance,
+    normalized = TRUE
+  )
+  
+  clo <- closeness(
+    g,
+    weights = E(g)$distance,
+    normalized = TRUE
+  )
+  
+  eig <- eigen_centrality(
+    g,
+    weights = E(g)$weight
+  )$vector
+  
+  hubs <- data.frame(
+    GeneLabel = V(g)$name,
+    Degree = deg[V(g)$name],
+    Betweenness = bet[V(g)$name],
+    Closeness = clo[V(g)$name],
+    EigenCentrality = eig[V(g)$name],
+    stringsAsFactors = FALSE
+  )
+  
+  hubs <- hubs %>%
+    left_join(gene_annotation, by = "GeneLabel") %>%
+    arrange(desc(Degree), desc(Betweenness))
+  
+  write.table(
+    hubs,
+    paste0("Hubs_", name, ".csv"),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  message("✅ Rede salva: Edges_", name, ".csv e Hubs_", name, ".csv")
+}
+
+# =========================
+# 4. Rodar para cada tratamento/tempo
+# =========================
+
+build_network("C_12h", "C_12h", cor_cut = 0.85)
+build_network("C_48h", "C_48h", cor_cut = 0.85)
+build_network("C_1w",  "C_1w",  cor_cut = 0.85)
+
+build_network("T_12h", "T_12h", cor_cut = 0.85)
+build_network("T_48h", "T_48h", cor_cut = 0.85)
+build_network("T_1w",  "T_1w",  cor_cut = 0.85)
