@@ -1,0 +1,208 @@
+library(tidyverse)
+library(igraph)
+library(readxl)
+
+# =========================
+# 1. Ler arquivo normalizado
+# =========================
+
+expr_file <- "Ale_Matriz_Normalizada_log2CPM.xlsx"
+
+expr_raw <- read_excel(
+  expr_file,
+  sheet = "Matriz_Normalizada_log2CPM"
+)
+
+expr_raw <- as.data.frame(expr_raw)
+
+# =========================
+# 2. Definir genes e matriz
+# =========================
+
+expr_raw$GeneLabel <- make.unique(
+  paste(expr_raw$GeneID, expr_raw$geneName, sep = "_")
+)
+
+sample_cols <- grep(
+  "^(C|T)_(12h|48h|1w)_rep[0-9]+$",
+  colnames(expr_raw),
+  value = TRUE
+)
+
+if (length(sample_cols) == 0) {
+  stop("Nenhuma coluna de amostra encontrada. Confira os nomes das colunas.")
+}
+
+all_mat <- expr_raw[, sample_cols, drop = FALSE]
+rownames(all_mat) <- expr_raw$GeneLabel
+
+all_mat[] <- lapply(all_mat, function(x) as.numeric(as.character(x)))
+
+# remover genes com NA
+all_mat <- all_mat[rowSums(is.na(all_mat)) == 0, ]
+
+# =========================
+# 3. Definir grupos funcionais
+# =========================
+# Como seu arquivo único não separa photo/sugar,
+# vamos usar geneName para classificar automaticamente.
+
+photo_keywords <- c(
+  "photosystem", "chlorophyll", "rubisco", "calvin",
+  "ferredoxin", "light", "psa", "psb", "carbonic"
+)
+
+sugar_keywords <- c(
+  "sugar", "starch", "sucrose", "glucose", "fructose",
+  "hexokinase", "invertase", "amylase", "trehalose",
+  "glycolysis", "glycosyl", "synthase", "transporter"
+)
+
+expr_raw$FunctionalGroup <- case_when(
+  str_detect(
+    tolower(expr_raw$geneName),
+    paste(photo_keywords, collapse = "|")
+  ) ~ "Photosynthesis",
+  
+  str_detect(
+    tolower(expr_raw$geneName),
+    paste(sugar_keywords, collapse = "|")
+  ) ~ "Sugar",
+  
+  TRUE ~ "Other"
+)
+
+gene_group <- expr_raw %>%
+  select(GeneLabel, GeneID, geneName, FunctionalGroup)
+
+photo_genes <- gene_group %>%
+  filter(FunctionalGroup == "Photosynthesis") %>%
+  pull(GeneLabel)
+
+sugar_genes <- gene_group %>%
+  filter(FunctionalGroup == "Sugar") %>%
+  pull(GeneLabel)
+
+cat("Photosynthesis genes:", length(photo_genes), "\n")
+cat("Sugar genes:", length(sugar_genes), "\n")
+
+if (length(photo_genes) == 0 | length(sugar_genes) == 0) {
+  stop("Não foram encontrados genes suficientes de Photosynthesis ou Sugar.")
+}
+
+# =========================
+# 4. Função para construir rede por tratamento
+# =========================
+
+build_network <- function(treatment_pattern, name, cor_cut = 0.85) {
+  
+  message("Processando tratamento: ", name, "...")
+  
+  cols <- grep(
+    paste0("^", treatment_pattern, "_rep[0-9]+$"),
+    colnames(all_mat),
+    value = TRUE
+  )
+  
+  if (length(cols) < 2) {
+    message("Poucas colunas encontradas para: ", name)
+    return(NULL)
+  }
+  
+  mat <- all_mat[, cols, drop = FALSE]
+  
+  cor_matrix <- cor(
+    t(mat[photo_genes, , drop = FALSE]),
+    t(mat[sugar_genes, , drop = FALSE]),
+    method = "pearson",
+    use = "pairwise.complete.obs"
+  )
+  
+  edges_idx <- which(
+    abs(cor_matrix) > cor_cut,
+    arr.ind = TRUE
+  )
+  
+  if (nrow(edges_idx) == 0) {
+    message("Nenhuma aresta encontrada para: ", name)
+    return(NULL)
+  }
+  
+  network <- data.frame(
+    source = rownames(cor_matrix)[edges_idx[, 1]],
+    target = colnames(cor_matrix)[edges_idx[, 2]],
+    correlation = cor_matrix[edges_idx]
+  )
+  
+  network$weight <- 1 - abs(network$correlation)
+  network$weight <- pmax(network$weight, 1e-6)
+  
+  write.table(
+    network,
+    paste0("Edges_", name, ".csv"),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  g <- graph_from_data_frame(
+    network,
+    directed = FALSE
+  )
+  
+  E(g)$weight <- network$weight
+  
+  deg <- degree(g)
+  bet <- betweenness(
+    g,
+    weights = E(g)$weight,
+    normalized = TRUE
+  )
+  clo <- closeness(
+    g,
+    weights = E(g)$weight
+  )
+  
+  hubs <- data.frame(
+    GeneLabel = V(g)$name,
+    Degree = deg,
+    Betweenness = bet,
+    Closeness = clo
+  )
+  
+  hubs <- hubs %>%
+    left_join(gene_group, by = "GeneLabel")
+  
+  hubs$ColorHex <- case_when(
+    hubs$FunctionalGroup == "Sugar" ~ "#3399FF",
+    hubs$FunctionalGroup == "Photosynthesis" ~ "#66CC00",
+    TRUE ~ "#999999"
+  )
+  
+  hubs <- hubs %>%
+    arrange(desc(Betweenness))
+  
+  write.table(
+    hubs,
+    paste0("Hubs_", name, ".csv"),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  message("Rede salva: Edges_", name, ".csv e Hubs_", name, ".csv")
+}
+
+# =========================
+# 5. Rodar para cada tratamento/tempo
+# =========================
+
+build_network("C_12h", "C_12h")
+build_network("C_48h", "C_48h")
+build_network("C_1w",  "C_1w")
+
+build_network("T_12h", "T_12h")
+build_network("T_48h", "T_48h")
+build_network("T_1w",  "T_1w")
