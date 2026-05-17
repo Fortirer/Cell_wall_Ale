@@ -1,0 +1,332 @@
+library(tidyverse)
+library(igraph)
+library(readxl)
+library(scales)
+
+# =========================
+# 1. Ler arquivo normalizado
+# =========================
+
+expr_file <- "Ale_Matriz_Normalizada_log2CPM.xlsx"
+
+expr_raw <- read_excel(
+  expr_file,
+  sheet = "Matriz_Normalizada_log2CPM"
+)
+
+expr_raw <- as.data.frame(expr_raw)
+
+# =========================
+# 2. Criar diretório de saída
+# =========================
+
+outdir <- "cytoscape_networks_by_treatment"
+
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+# =========================
+# 3. Definir genes e matriz
+# =========================
+
+expr_raw$GeneLabel <- make.unique(
+  paste(expr_raw$GeneID, expr_raw$geneName, sep = "_")
+)
+
+sample_cols <- grep(
+  "^(C|T)_(12h|48h|1w)_rep[0-9]+$",
+  colnames(expr_raw),
+  value = TRUE
+)
+
+if (length(sample_cols) == 0) {
+  stop("Nenhuma coluna de amostra encontrada. Confira os nomes das colunas.")
+}
+
+all_mat <- expr_raw[, sample_cols, drop = FALSE]
+rownames(all_mat) <- expr_raw$GeneLabel
+
+all_mat[] <- lapply(
+  all_mat,
+  function(x) as.numeric(as.character(x))
+)
+
+all_mat <- all_mat[rowSums(is.na(all_mat)) == 0, ]
+
+gene_annotation <- expr_raw %>%
+  select(GeneLabel, GeneID, geneName)
+
+# =========================
+# 4. Função para rede por tratamento
+# =========================
+
+build_cytoscape_network <- function(
+    treatment_pattern,
+    name,
+    cor_cut = 0.85,
+    top_n = 20
+) {
+  
+  message("Processando tratamento: ", name, "...")
+  
+  cols <- grep(
+    paste0("^", treatment_pattern, "_rep[0-9]+$"),
+    colnames(all_mat),
+    value = TRUE
+  )
+  
+  if (length(cols) < 2) {
+    message("Poucas colunas encontradas para: ", name)
+    return(NULL)
+  }
+  
+  mat <- all_mat[, cols, drop = FALSE]
+  
+  gene_var <- apply(mat, 1, var, na.rm = TRUE)
+  mat <- mat[gene_var > 0, , drop = FALSE]
+  
+  if (nrow(mat) < 2) {
+    message("Poucos genes com variação para: ", name)
+    return(NULL)
+  }
+  
+  cor_matrix <- cor(
+    t(mat),
+    method = "pearson",
+    use = "pairwise.complete.obs"
+  )
+  
+  diag(cor_matrix) <- NA
+  
+  edges_idx <- which(
+    abs(cor_matrix) > cor_cut,
+    arr.ind = TRUE
+  )
+  
+  edges_idx <- edges_idx[
+    edges_idx[, 1] < edges_idx[, 2],
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(edges_idx) == 0) {
+    message("Nenhuma aresta encontrada para: ", name)
+    return(NULL)
+  }
+  
+  # =========================
+  # EDGES COMPLETAS
+  # =========================
+  
+  edges <- data.frame(
+    source = rownames(cor_matrix)[edges_idx[, 1]],
+    target = colnames(cor_matrix)[edges_idx[, 2]],
+    interaction = "coexpression",
+    correlation = cor_matrix[edges_idx],
+    abs_correlation = abs(cor_matrix[edges_idx]),
+    sign = ifelse(cor_matrix[edges_idx] > 0, "positive", "negative"),
+    weight = abs(cor_matrix[edges_idx]),
+    distance = 1 - abs(cor_matrix[edges_idx]),
+    Treatment = name,
+    stringsAsFactors = FALSE
+  )
+  
+  edges$distance <- pmax(edges$distance, 1e-6)
+  
+  write.table(
+    edges,
+    file.path(outdir, paste0("Cytoscape_", name, "_edges.csv")),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # =========================
+  # GRAFO
+  # =========================
+  
+  g <- graph_from_data_frame(
+    edges,
+    directed = FALSE
+  )
+  
+  E(g)$weight <- edges$weight
+  E(g)$distance <- edges$distance
+  
+  # =========================
+  # CENTRALIDADE
+  # =========================
+  
+  deg <- degree(g)
+  
+  bet <- betweenness(
+    g,
+    weights = E(g)$distance,
+    normalized = TRUE
+  )
+  
+  clo <- closeness(
+    g,
+    weights = E(g)$distance,
+    normalized = TRUE
+  )
+  
+  eig <- eigen_centrality(
+    g,
+    weights = E(g)$weight
+  )$vector
+  
+  # =========================
+  # NODES COMPLETOS
+  # =========================
+  
+  nodes <- data.frame(
+    GeneLabel = V(g)$name,
+    Degree = deg[V(g)$name],
+    Betweenness = bet[V(g)$name],
+    Closeness = clo[V(g)$name],
+    EigenCentrality = eig[V(g)$name],
+    Treatment = name,
+    stringsAsFactors = FALSE
+  )
+  
+  nodes <- nodes %>%
+    left_join(gene_annotation, by = "GeneLabel") %>%
+    arrange(
+      desc(Degree),
+      desc(Betweenness),
+      desc(EigenCentrality)
+    ) %>%
+    mutate(
+      HubRank = row_number(),
+      HubClass = case_when(
+        HubRank <= top_n ~ paste0("Top", top_n, "_hub"),
+        TRUE ~ "Non_top_hub"
+      ),
+      NodeSize = scales::rescale(Degree, to = c(20, 80)),
+      NodeColor = case_when(
+        HubRank <= top_n ~ "#D73027",
+        TRUE ~ "#BDBDBD"
+      )
+    )
+  
+  write.table(
+    nodes,
+    file.path(outdir, paste0("Cytoscape_", name, "_nodes.csv")),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # =========================
+  # TOP HUBS TABELA
+  # =========================
+  
+  top_hubs <- nodes %>%
+    filter(HubRank <= top_n) %>%
+    select(
+      Treatment,
+      HubRank,
+      GeneLabel,
+      GeneID,
+      geneName,
+      Degree,
+      Betweenness,
+      Closeness,
+      EigenCentrality,
+      HubClass,
+      NodeSize,
+      NodeColor
+    )
+  
+  write.table(
+    top_hubs,
+    file.path(outdir, paste0("Top", top_n, "_Hubs_", name, ".csv")),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # =========================
+  # TOP HUB NETWORK PARA CYTOSCAPE
+  # =========================
+  
+  top_hub_genes <- top_hubs$GeneLabel
+  
+  top_edges <- edges %>%
+    filter(
+      source %in% top_hub_genes &
+        target %in% top_hub_genes
+    )
+  
+  top_nodes <- nodes %>%
+    filter(
+      GeneLabel %in% unique(c(top_edges$source, top_edges$target))
+    )
+  
+  write.table(
+    top_edges,
+    file.path(outdir, paste0("Cytoscape_Top", top_n, "_", name, "_edges.csv")),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  write.table(
+    top_nodes,
+    file.path(outdir, paste0("Cytoscape_Top", top_n, "_", name, "_nodes.csv")),
+    sep = ";",
+    dec = ".",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  message("Arquivos salvos para: ", name)
+  
+  return(top_hubs)
+}
+
+# =========================
+# 5. Rodar para cada tratamento
+# =========================
+
+top_C_12h <- build_cytoscape_network("C_12h", "C_12h", cor_cut = 0.85, top_n = 20)
+top_C_48h <- build_cytoscape_network("C_48h", "C_48h", cor_cut = 0.85, top_n = 20)
+top_C_1w  <- build_cytoscape_network("C_1w",  "C_1w",  cor_cut = 0.85, top_n = 20)
+
+top_T_12h <- build_cytoscape_network("T_12h", "T_12h", cor_cut = 0.85, top_n = 20)
+top_T_48h <- build_cytoscape_network("T_48h", "T_48h", cor_cut = 0.85, top_n = 20)
+top_T_1w  <- build_cytoscape_network("T_1w",  "T_1w",  cor_cut = 0.85, top_n = 20)
+
+# =========================
+# 6. Tabela geral de top hubs
+# =========================
+
+top_hubs_all <- bind_rows(
+  top_C_12h,
+  top_C_48h,
+  top_C_1w,
+  top_T_12h,
+  top_T_48h,
+  top_T_1w
+)
+
+write.table(
+  top_hubs_all,
+  file.path(outdir, "Top20_Hubs_all_treatments.csv"),
+  sep = ";",
+  dec = ".",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+cat("\nAnálise finalizada.\n")
+cat("Arquivos salvos em:", outdir, "\n")
+cat("Arquivos completos: Cytoscape_*_edges.csv e Cytoscape_*_nodes.csv\n")
+cat("Arquivos Top hubs: Cytoscape_Top20_*_edges.csv e Cytoscape_Top20_*_nodes.csv\n")
+
