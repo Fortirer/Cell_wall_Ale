@@ -1,0 +1,1151 @@
+# ==============================================================================
+# WGCNA FOR TRANSCRIPTOME DATA ONLY
+# Adapted treatments:
+# C_12h, C_48h, C_1w, T_12h, T_48h, T_1w
+# ==============================================================================
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+# =========================
+# 1) PACKAGES
+# =========================
+required_pkgs <- c(
+  "WGCNA",
+  "dynamicTreeCut",
+  "fastcluster",
+  "data.table",
+  "readxl",
+  "ggplot2",
+  "dplyr",
+  "tidyr",
+  "stringr"
+)
+
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+library(WGCNA)
+library(dynamicTreeCut)
+library(fastcluster)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+allowWGCNAThreads()
+
+# =========================
+# 2) INPUT FILE
+# =========================
+expr_file <- "Ale_Matriz_Normalizada_log2CPM.xlsx"
+
+resdir  <- "wgcna_results_C_T_time"
+figdir  <- file.path(resdir, "figures")
+cytodir <- file.path(resdir, "cytoscape")
+cyto_top50_dir <- file.path(resdir, "cytoscape_top50_ready")
+
+dir.create(resdir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figdir, showWarnings = FALSE, recursive = TRUE)
+dir.create(cytodir, showWarnings = FALSE, recursive = TRUE)
+dir.create(cyto_top50_dir, showWarnings = FALSE, recursive = TRUE)
+
+# =========================
+# 3) READ TRANSCRIPTOME
+# =========================
+expr_raw <- read_excel(
+  expr_file,
+  sheet = "Matriz_Normalizada_log2CPM"
+)
+
+expr_raw <- as.data.frame(expr_raw)
+
+colnames(expr_raw)[1] <- gsub("^\\ufeff", "", colnames(expr_raw)[1])
+
+# =========================
+# 4) DEFINE COLUMNS
+# =========================
+meta_cols <- c("geneName", "GeneID")
+
+sample_cols <- grep(
+  "^(C|T)_(12h|48h|1w)_rep[0-9]+$",
+  colnames(expr_raw),
+  value = TRUE
+)
+
+sample_cols <- sample_cols[sample_cols %in% colnames(expr_raw)]
+
+if (length(sample_cols) < 2) {
+  stop("Poucas colunas de amostras encontradas. Verifique os nomes: C_12h, C_48h, C_1w, T_12h, T_48h, T_1w")
+}
+
+# =========================
+# 5) GENE LABEL
+# =========================
+expr_raw$GeneLabel <- make.unique(
+  paste(
+    expr_raw$GeneID,
+    expr_raw$geneName,
+    sep = "_"
+  )
+)
+
+# =========================
+# 6) EXPRESSION MATRIX
+# =========================
+expr_mat <- expr_raw[, sample_cols, drop = FALSE]
+rownames(expr_mat) <- expr_raw$GeneLabel
+
+expr_mat[] <- lapply(
+  expr_mat,
+  function(x) as.numeric(as.character(x))
+)
+
+na_gene <- rowSums(is.na(expr_mat)) > 0
+
+if (any(na_gene)) {
+  message(sum(na_gene), " genes removed due to missing values.")
+  expr_mat <- expr_mat[!na_gene, , drop = FALSE]
+}
+
+expr_raw2 <- expr_raw[
+  match(rownames(expr_mat), expr_raw$GeneLabel),
+  ,
+  drop = FALSE
+]
+
+# =========================
+# 7) SAMPLE INFORMATION
+# =========================
+sample_info <- data.frame(
+  Sample = colnames(expr_mat),
+  Treatment = colnames(expr_mat),
+  stringsAsFactors = FALSE
+)
+
+sample_info$Treatment <- factor(
+  sample_info$Treatment,
+  levels = c(
+    "C_12h",
+    "C_48h",
+    "C_1w",
+    "T_12h",
+    "T_48h",
+    "T_1w"
+  )
+)
+
+write.csv(
+  sample_info,
+  file = file.path(resdir, "sample_info.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 8) PREPARE FOR WGCNA
+# =========================
+datExpr <- as.data.frame(t(expr_mat))
+
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+
+if (!gsg$allOK) {
+  
+  if (sum(!gsg$goodGenes) > 0) {
+    message(
+      "Removing genes: ",
+      paste(colnames(datExpr)[!gsg$goodGenes], collapse = ", ")
+    )
+  }
+  
+  if (sum(!gsg$goodSamples) > 0) {
+    message(
+      "Removing samples: ",
+      paste(rownames(datExpr)[!gsg$goodSamples], collapse = ", ")
+    )
+  }
+  
+  datExpr <- datExpr[
+    gsg$goodSamples,
+    gsg$goodGenes,
+    drop = FALSE
+  ]
+  
+  sample_info <- sample_info[
+    match(rownames(datExpr), sample_info$Sample),
+    ,
+    drop = FALSE
+  ]
+}
+
+# =========================
+# 9) SAMPLE CLUSTERING
+# =========================
+sampleTree <- hclust(
+  dist(datExpr),
+  method = "average"
+)
+
+pdf(
+  file.path(figdir, "sample_clustering.pdf"),
+  width = 10,
+  height = 6
+)
+
+plot(
+  sampleTree,
+  main = "Sample clustering",
+  sub = "",
+  xlab = "",
+  cex.lab = 1.2
+)
+
+dev.off()
+
+# =========================
+# 10) SOFT-THRESHOLD POWER
+# =========================
+powers <- c(1:10, seq(12, 30, by = 2))
+
+sft <- pickSoftThreshold(
+  datExpr,
+  powerVector = powers,
+  verbose = 5,
+  networkType = "signed"
+)
+
+write.csv(
+  sft$fitIndices,
+  file = file.path(resdir, "soft_threshold_results.csv"),
+  row.names = FALSE
+)
+
+if (!is.na(sft$powerEstimate)) {
+  softPower <- sft$powerEstimate
+} else {
+  softPower <- 12
+}
+
+cat("Selected soft-threshold power:", softPower, "\n")
+
+pdf(
+  file.path(figdir, "soft_threshold_plots.pdf"),
+  width = 12,
+  height = 5
+)
+
+par(mfrow = c(1, 2))
+
+plot(
+  sft$fitIndices[, 1],
+  -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+  xlab = "Soft Threshold (power)",
+  ylab = "Scale Free Topology Model Fit, signed R²",
+  type = "n",
+  main = "Scale independence"
+)
+
+text(
+  sft$fitIndices[, 1],
+  -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+  labels = powers,
+  cex = 0.9
+)
+
+abline(h = 0.8, col = "red", lty = 2)
+
+plot(
+  sft$fitIndices[, 1],
+  sft$fitIndices[, 5],
+  xlab = "Soft Threshold (power)",
+  ylab = "Mean Connectivity",
+  type = "n",
+  main = "Mean connectivity"
+)
+
+text(
+  sft$fitIndices[, 1],
+  sft$fitIndices[, 5],
+  labels = powers,
+  cex = 0.9
+)
+
+dev.off()
+
+# =========================
+# 11) NETWORK + MODULE DETECTION
+# =========================
+adjacency_mat <- adjacency(
+  datExpr,
+  power = softPower,
+  type = "signed"
+)
+
+TOM <- TOMsimilarity(
+  adjacency_mat,
+  TOMType = "signed"
+)
+
+dissTOM <- 1 - TOM
+
+geneTree <- fastcluster::hclust(
+  as.dist(dissTOM),
+  method = "average"
+)
+
+minModuleSize <- 30
+
+dynamicMods <- cutreeDynamic(
+  dendro = geneTree,
+  distM = dissTOM,
+  deepSplit = 2,
+  pamRespectsDendro = FALSE,
+  minClusterSize = minModuleSize
+)
+
+dynamicColors <- labels2colors(dynamicMods)
+
+MEList <- moduleEigengenes(
+  datExpr,
+  colors = dynamicColors
+)
+
+MEs <- MEList$eigengenes
+
+MEDiss <- 1 - cor(
+  MEs,
+  use = "pairwise.complete.obs"
+)
+
+METree <- hclust(
+  as.dist(MEDiss),
+  method = "average"
+)
+
+mergeCutHeight <- 0.25
+
+merge <- mergeCloseModules(
+  datExpr,
+  dynamicColors,
+  cutHeight = mergeCutHeight,
+  verbose = 3
+)
+
+moduleColors <- merge$colors
+mergedMEs <- merge$newMEs
+
+pdf(
+  file.path(figdir, "gene_dendrogram_modules.pdf"),
+  width = 14,
+  height = 7
+)
+
+plotDendroAndColors(
+  geneTree,
+  cbind(dynamicColors, moduleColors),
+  c("Dynamic Tree", "Merged modules"),
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Gene dendrogram and module colors"
+)
+
+dev.off()
+
+# =========================
+# 12) MODULE ASSIGNMENT TABLE
+# =========================
+gene_annotation <- expr_raw2[
+  ,
+  c("geneName", "GeneID", "GeneLabel"),
+  drop = FALSE
+]
+
+gene_annotation <- gene_annotation[
+  match(colnames(datExpr), gene_annotation$GeneLabel),
+  ,
+  drop = FALSE
+]
+
+module_assignments <- data.frame(
+  GeneLabel = colnames(datExpr),
+  geneName = gene_annotation$geneName,
+  GeneID = gene_annotation$GeneID,
+  ModuleColor = moduleColors,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  module_assignments,
+  file = file.path(resdir, "module_assignments.csv"),
+  row.names = FALSE
+)
+
+module_summary <- as.data.frame(
+  table(module_assignments$ModuleColor),
+  stringsAsFactors = FALSE
+)
+
+colnames(module_summary) <- c(
+  "ModuleColor",
+  "GeneCount"
+)
+
+module_summary <- module_summary[
+  order(-module_summary$GeneCount),
+]
+
+write.csv(
+  module_summary,
+  file = file.path(resdir, "module_summary.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 13) MODULE EIGENGENES
+# =========================
+MEs0 <- moduleEigengenes(
+  datExpr,
+  colors = moduleColors
+)$eigengenes
+
+MEs <- orderMEs(MEs0)
+
+module_eigengenes <- data.frame(
+  Sample = rownames(datExpr),
+  Treatment = sample_info$Treatment,
+  MEs,
+  check.names = FALSE
+)
+
+write.csv(
+  module_eigengenes,
+  file = file.path(resdir, "module_eigengenes.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 14) MODULE ACTIVITY BY TREATMENT
+# =========================
+ME_names <- names(MEs)
+
+module_treatment_mean <- aggregate(
+  module_eigengenes[, ME_names, drop = FALSE],
+  by = list(Treatment = module_eigengenes$Treatment),
+  FUN = mean
+)
+
+write.csv(
+  module_treatment_mean,
+  file = file.path(resdir, "module_activity_by_treatment.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 15) MODULE MEMBERSHIP
+# =========================
+MM_list <- list()
+
+for (me in names(MEs)) {
+  
+  mm <- cor(
+    datExpr,
+    MEs[[me]],
+    use = "pairwise.complete.obs"
+  )
+  
+  mp <- corPvalueStudent(
+    mm,
+    nSamples = nrow(datExpr)
+  )
+  
+  tmp <- data.frame(
+    GeneLabel = colnames(datExpr),
+    Module = me,
+    MM = as.numeric(mm),
+    MM_abs = abs(as.numeric(mm)),
+    MM_pvalue = as.numeric(mp),
+    stringsAsFactors = FALSE
+  )
+  
+  MM_list[[me]] <- tmp
+}
+
+module_membership <- do.call(
+  rbind,
+  MM_list
+)
+
+write.csv(
+  module_membership,
+  file = file.path(resdir, "module_membership.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 16) HUB GENES BY MODULE
+# =========================
+IMconn <- intramodularConnectivity(
+  adjacency_mat,
+  moduleColors
+)
+
+hub_table <- data.frame(
+  GeneLabel = rownames(IMconn),
+  kWithin = IMconn$kWithin,
+  kOut = IMconn$kOut,
+  kTotal = IMconn$kTotal,
+  ModuleColor = moduleColors,
+  stringsAsFactors = FALSE
+)
+
+hub_table <- merge(
+  hub_table,
+  gene_annotation,
+  by = "GeneLabel",
+  all.x = TRUE
+)
+
+hub_table <- hub_table[
+  order(
+    hub_table$ModuleColor,
+    -hub_table$kWithin
+  ),
+]
+
+write.csv(
+  hub_table,
+  file = file.path(resdir, "hub_genes_by_module.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 17) TOP 50 HUBS EACH MODULE
+# =========================
+module_membership_wide <- module_membership %>%
+  mutate(ModuleColor = sub("^ME", "", Module)) %>%
+  select(
+    GeneLabel,
+    Module,
+    ModuleColor,
+    MM,
+    MM_abs,
+    MM_pvalue
+  )
+
+hub_table2 <- hub_table %>%
+  left_join(
+    module_membership_wide,
+    by = c("GeneLabel", "ModuleColor")
+  )
+
+hub_table2 <- hub_table2 %>%
+  group_by(ModuleColor, GeneLabel) %>%
+  arrange(
+    desc(kWithin),
+    desc(MM_abs),
+    .by_group = TRUE
+  ) %>%
+  slice(1) %>%
+  ungroup()
+
+top50_hubs_each_module <- hub_table2 %>%
+  group_by(ModuleColor) %>%
+  arrange(
+    desc(kWithin),
+    desc(MM_abs),
+    .by_group = TRUE
+  ) %>%
+  mutate(HubRank = row_number()) %>%
+  slice_head(n = 50) %>%
+  ungroup() %>%
+  select(
+    ModuleColor,
+    HubRank,
+    GeneLabel,
+    GeneID,
+    geneName,
+    kWithin,
+    kOut,
+    kTotal,
+    MM,
+    MM_abs,
+    MM_pvalue
+  ) %>%
+  arrange(ModuleColor, HubRank)
+
+write.csv(
+  top50_hubs_each_module,
+  file = file.path(resdir, "top50_hubs_each_module_single_table.csv"),
+  row.names = FALSE
+)
+
+# =========================
+# 18) HEATMAP MODULE MEAN BY TREATMENT
+# =========================
+heat_df <- module_treatment_mean %>%
+  pivot_longer(
+    -Treatment,
+    names_to = "Module",
+    values_to = "Eigengene"
+  )
+
+p <- ggplot(
+  heat_df,
+  aes(
+    x = Treatment,
+    y = Module,
+    fill = Eigengene
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.4
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0
+  ) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Module activity across treatments",
+    x = "Treatment",
+    y = "Module eigengene",
+    fill = "Activity"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+ggsave(
+  file.path(figdir, "Heatmap_modules_by_treatment.png"),
+  p,
+  width = 7,
+  height = 8,
+  dpi = 400
+)
+
+# =========================
+# 19) HEATMAP MODULE Z-SCORE BY TREATMENT
+# =========================
+heat_mat <- module_treatment_mean[
+  ,
+  ME_names,
+  drop = FALSE
+]
+
+heat_scaled <- scale(heat_mat)
+heat_scaled <- as.data.frame(heat_scaled)
+
+heat_scaled$Treatment <- module_treatment_mean$Treatment
+
+heat_long <- heat_scaled %>%
+  pivot_longer(
+    -Treatment,
+    names_to = "Module",
+    values_to = "Zscore"
+  )
+
+p2 <- ggplot(
+  heat_long,
+  aes(
+    x = Treatment,
+    y = Module,
+    fill = Zscore
+  )
+) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B"
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Module Z-score activity by treatment",
+    x = "Treatment",
+    y = "Module"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+ggsave(
+  file.path(figdir, "Heatmap_modules_by_treatment_Zscore.png"),
+  p2,
+  width = 7,
+  height = 8,
+  dpi = 400
+)
+
+# =========================
+# 20) MODULE × TREATMENT CORRELATION HEATMAP
+# =========================
+MEs_cor <- module_eigengenes[
+  ,
+  ME_names,
+  drop = FALSE
+]
+
+rownames(MEs_cor) <- module_eigengenes$Sample
+
+module_eigengenes$Treatment <- factor(
+  module_eigengenes$Treatment,
+  levels = c(
+    "C_12h",
+    "C_48h",
+    "C_1w",
+    "T_12h",
+    "T_48h",
+    "T_1w"
+  )
+)
+
+treatment_matrix <- model.matrix(
+  ~ Treatment - 1,
+  data = module_eigengenes
+)
+
+colnames(treatment_matrix) <- gsub(
+  "Treatment",
+  "",
+  colnames(treatment_matrix)
+)
+
+treatment_matrix <- treatment_matrix[
+  ,
+  c(
+    "C_12h",
+    "C_48h",
+    "C_1w",
+    "T_12h",
+    "T_48h",
+    "T_1w"
+  ),
+  drop = FALSE
+]
+
+moduleTreatCor <- cor(
+  MEs_cor,
+  treatment_matrix,
+  use = "pairwise.complete.obs"
+)
+
+moduleTreatPvalue <- corPvalueStudent(
+  moduleTreatCor,
+  nSamples = nrow(MEs_cor)
+)
+
+write.csv(
+  moduleTreatCor,
+  file = file.path(resdir, "module_treatment_correlations.csv")
+)
+
+write.csv(
+  moduleTreatPvalue,
+  file = file.path(resdir, "module_treatment_pvalues.csv")
+)
+
+textMatrix <- paste(
+  signif(moduleTreatCor, 2),
+  "\n(",
+  signif(moduleTreatPvalue, 1),
+  ")",
+  sep = ""
+)
+
+dim(textMatrix) <- dim(moduleTreatCor)
+
+pdf(
+  file.path(figdir, "Heatmap_module_treatment_correlation.pdf"),
+  width = 8,
+  height = 9
+)
+
+par(mar = c(9, 10, 3, 3))
+
+labeledHeatmap(
+  Matrix = moduleTreatCor,
+  xLabels = c(
+    "C_12h",
+    "C_48h",
+    "C_1w",
+    "T_12h",
+    "T_48h",
+    "T_1w"
+  ),
+  yLabels = rownames(moduleTreatCor),
+  ySymbols = rownames(moduleTreatCor),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  setStdMargins = FALSE,
+  cex.text = 0.6,
+  zlim = c(-1, 1),
+  main = "Module–treatment relationships"
+)
+
+dev.off()
+
+# =========================
+# 21) EIGENGENE PLOTS BY TREATMENT
+# =========================
+plot_ME_by_treatment <- function(module_name, outname) {
+  
+  if (!(module_name %in% colnames(module_eigengenes))) {
+    return(NULL)
+  }
+  
+  df <- module_eigengenes %>%
+    select(
+      Sample,
+      Treatment,
+      all_of(module_name)
+    ) %>%
+    rename(
+      Eigengene = all_of(module_name)
+    )
+  
+  p <- ggplot(
+    df,
+    aes(
+      x = Treatment,
+      y = Eigengene
+    )
+  ) +
+    geom_boxplot(
+      outlier.shape = NA,
+      linewidth = 0.5
+    ) +
+    geom_jitter(
+      width = 0.12,
+      size = 2,
+      alpha = 0.8
+    ) +
+    theme_classic(base_size = 12) +
+    labs(
+      title = paste0(
+        module_name,
+        " eigengene by treatment"
+      ),
+      x = NULL,
+      y = "Module eigengene"
+    ) +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      )
+    )
+  
+  ggsave(
+    outname,
+    p,
+    width = 6,
+    height = 4.5,
+    dpi = 300
+  )
+}
+
+for (mod in ME_names) {
+  plot_ME_by_treatment(
+    mod,
+    file.path(
+      figdir,
+      paste0(
+        "Eigengene_by_treatment_",
+        mod,
+        ".png"
+      )
+    )
+  )
+}
+
+# =========================
+# 22) CYTOSCAPE EXPORT FOR ALL MODULES
+# =========================
+export_module_to_cytoscape <- function(
+    module_color,
+    top_n_genes = 80,
+    edge_threshold = 0.10
+) {
+  
+  inModule <- moduleColors == module_color
+  mod_genes <- colnames(datExpr)[inModule]
+  
+  if (length(mod_genes) < 2) {
+    return(NULL)
+  }
+  
+  mod_adj <- adjacency_mat[inModule, inModule]
+  rownames(mod_adj) <- mod_genes
+  colnames(mod_adj) <- mod_genes
+  
+  conn <- rowSums(
+    mod_adj,
+    na.rm = TRUE
+  )
+  
+  top_genes <- names(
+    sort(
+      conn,
+      decreasing = TRUE
+    )
+  )[1:min(top_n_genes, length(conn))]
+  
+  mod_TOM <- TOM[inModule, inModule]
+  dimnames(mod_TOM) <- list(
+    mod_genes,
+    mod_genes
+  )
+  
+  mod_TOM_top <- mod_TOM[
+    top_genes,
+    top_genes,
+    drop = FALSE
+  ]
+  
+  node_annot <- module_assignments %>%
+    filter(GeneLabel %in% top_genes) %>%
+    select(
+      GeneLabel,
+      GeneID,
+      geneName,
+      ModuleColor
+    )
+  
+  node_annot <- node_annot %>%
+    left_join(
+      hub_table %>%
+        select(
+          GeneLabel,
+          kWithin,
+          kTotal
+        ),
+      by = "GeneLabel"
+    )
+  
+  exportNetworkToCytoscape(
+    mod_TOM_top,
+    edgeFile = file.path(
+      cytodir,
+      paste0(
+        "module_",
+        module_color,
+        "_edges.txt"
+      )
+    ),
+    nodeFile = file.path(
+      cytodir,
+      paste0(
+        "module_",
+        module_color,
+        "_nodes.txt"
+      )
+    ),
+    weighted = TRUE,
+    threshold = edge_threshold,
+    nodeNames = top_genes,
+    altNodeNames = top_genes,
+    nodeAttr = node_annot$ModuleColor
+  )
+  
+  write.csv(
+    node_annot,
+    file.path(
+      cytodir,
+      paste0(
+        "module_",
+        module_color,
+        "_node_annotation.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+}
+
+for (mod in unique(moduleColors)) {
+  if (mod == "grey") next
+  
+  export_module_to_cytoscape(
+    mod,
+    top_n_genes = 80,
+    edge_threshold = 0.10
+  )
+}
+
+# =========================
+# 23) CYTOSCAPE EXPORT TOP50 HUBS READY
+# =========================
+node_info_base <- hub_table %>%
+  left_join(
+    module_membership_wide,
+    by = c("GeneLabel", "ModuleColor")
+  ) %>%
+  select(
+    GeneLabel,
+    ModuleColor,
+    GeneID,
+    geneName,
+    kWithin,
+    kOut,
+    kTotal,
+    MM,
+    MM_abs,
+    MM_pvalue
+  )
+
+modules <- unique(
+  top50_hubs_each_module$ModuleColor
+)
+
+for (mod in modules) {
+  
+  cat("\nProcessing module:", mod, "\n")
+  
+  top_genes_df <- top50_hubs_each_module %>%
+    filter(ModuleColor == mod) %>%
+    arrange(HubRank)
+  
+  top_genes <- unique(
+    top_genes_df$GeneLabel
+  )
+  
+  if (length(top_genes) < 2) {
+    cat(
+      "Module",
+      mod,
+      "skipped: less than 2 genes.\n"
+    )
+    next
+  }
+  
+  inModule <- moduleColors == mod
+  mod_genes <- colnames(datExpr)[inModule]
+  
+  if (length(mod_genes) < 2) {
+    cat(
+      "Module",
+      mod,
+      "skipped: module has less than 2 genes in datExpr.\n"
+    )
+    next
+  }
+  
+  mod_TOM <- TOM[inModule, inModule]
+  
+  dimnames(mod_TOM) <- list(
+    mod_genes,
+    mod_genes
+  )
+  
+  keep_genes <- intersect(
+    top_genes,
+    mod_genes
+  )
+  
+  if (length(keep_genes) < 2) {
+    cat(
+      "Module",
+      mod,
+      "skipped: insufficient intersection.\n"
+    )
+    next
+  }
+  
+  mod_TOM_top <- mod_TOM[
+    keep_genes,
+    keep_genes,
+    drop = FALSE
+  ]
+  
+  node_annot <- node_info_base %>%
+    filter(GeneLabel %in% keep_genes) %>%
+    distinct(
+      GeneLabel,
+      .keep_all = TRUE
+    )
+  
+  node_annot <- node_annot[
+    match(
+      keep_genes,
+      node_annot$GeneLabel
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  edge_file <- file.path(
+    cyto_top50_dir,
+    paste0(
+      "edges_top50_module_",
+      mod,
+      ".txt"
+    )
+  )
+  
+  node_file <- file.path(
+    cyto_top50_dir,
+    paste0(
+      "nodes_top50_module_",
+      mod,
+      ".txt"
+    )
+  )
+  
+  exportNetworkToCytoscape(
+    mod_TOM_top,
+    weighted = TRUE,
+    threshold = 0.10,
+    edgeFile = edge_file,
+    nodeFile = node_file,
+    nodeNames = keep_genes,
+    altNodeNames = keep_genes,
+    nodeAttr = mod
+  )
+  
+  write.csv(
+    node_annot,
+    file.path(
+      cyto_top50_dir,
+      paste0(
+        "node_annotation_top50_module_",
+        mod,
+        ".csv"
+      )
+    ),
+    row.names = FALSE
+  )
+  
+  cat("Files created for module:", mod, "\n")
+}
+
+# =========================
+# 24) SAVE SESSION INFO
+# =========================
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    resdir,
+    "sessionInfo.txt"
+  )
+)
+
+cat("\nAnalysis completed.\n")
+cat("Results saved in:", resdir, "\n")
+cat("Figures saved in:", figdir, "\n")
+cat("Cytoscape files saved in:", cytodir, "\n")
+cat("Top50 Cytoscape files saved in:", cyto_top50_dir, "\n")
